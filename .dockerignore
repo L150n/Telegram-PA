@@ -1,0 +1,9 @@
+myenv
+venv
+.venv
+__pycache__
+*.pyc
+downloads
+logs
+.git
+.env
