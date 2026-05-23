@@ -115,6 +115,7 @@ ACTIVE_DOWNLOADS_LOCK = threading.Lock()
 # Scheduler
 TASK_MANAGER: TaskManager | None = None
 LAST_UPLOADED_SCRIPT_BY_ADMIN: dict[int, str] = {}
+TASK_NOTIFICATION_BOT = None
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1120,13 +1121,11 @@ def _is_admin(user_id: int) -> bool:
 
 async def _task_send_notification(message: str) -> None:
     """Send a task notification to all admins."""
-    if not TASK_MANAGER:
+    if TASK_NOTIFICATION_BOT is None:
         return
     for admin_id in ADMIN_CHAT_IDS:
         try:
-            # This will be set when the app is running
-            # For now, we'll use a placeholder
-            pass
+            await TASK_NOTIFICATION_BOT.send_message(chat_id=admin_id, text=message)
         except Exception as e:
             LOGGER.error(f"Failed to send notification to admin {admin_id}: {e}")
 
@@ -1312,16 +1311,19 @@ async def tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 def main() -> None:
-    global TASK_MANAGER
+    global TASK_MANAGER, TASK_NOTIFICATION_BOT
     
     # Initialize task manager
     # TaskManager expects the directory containing 'scheduler' folder
     TASK_MANAGER = TaskManager(
-        base_dir=Path(__file__).resolve().parent
+        base_dir=Path(__file__).resolve().parent,
+        bot_send_message=_task_send_notification,
     )
     
     async def post_init(application: Application) -> None:
         """Initialize resources after bot is ready."""
+        global TASK_NOTIFICATION_BOT
+        TASK_NOTIFICATION_BOT = application.bot
         await _set_bot_metadata(application)
         # Start the scheduler
         TASK_MANAGER.start()
