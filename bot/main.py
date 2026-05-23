@@ -155,13 +155,28 @@ async def today_logs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    del context
     if update.message is None or not update.message.text:
         return
 
     text = update.message.text.strip()
     user = update.effective_user
     username = user.username if user and user.username else "unknown"
+
+    if text.endswith(".py"):
+        await update.message.reply_text(
+            "If this is a scheduler script, upload it as a .py file document.\n"
+            'Then run: /task add "0 */5 * * * *"'
+        )
+        return
+
+    cron_like_tokens = [part for part in text.replace('"', "").replace("'", "").split() if part]
+    if len(cron_like_tokens) == 6 and user and _is_admin(user.id):
+        await update.message.reply_text(
+            "That looks like a cron schedule.\n"
+            'Use: /task add "0 */5 * * * *"\n'
+            "or /task add <script_name.py> \"<sec min hour day month day_of_week>\""
+        )
+        return
 
     if not is_valid_url(text):
         await update.message.reply_text(_invalid_message_text())
@@ -276,7 +291,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    del context
     if update.message is None or update.effective_user is None:
         return
     if not _is_admin(update.effective_user.id):
@@ -296,7 +310,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     target_path = scripts_dir / script_name
 
     try:
-        tg_file = await update.message.bot.get_file(document.file_id)
+        tg_file = await context.bot.get_file(document.file_id)
         await tg_file.download_to_drive(custom_path=str(target_path))
     except TelegramError as exc:
         LOGGER.error("Failed to download script file: %s", exc)
@@ -307,6 +321,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await update.message.reply_text(
         f"✅ Script saved: {script_name}\n"
         'Now run: /task add "0 */5 * * * *"\n'
+        "Example: /task add \"0 */5 * * * *\" (runs every 5 minutes)\n"
         "Or choose your own 6-field cron schedule."
     )
 
@@ -1039,6 +1054,7 @@ def _help_text() -> str:
         "/todaylogs - admin summary of today's user activity\n\n"
         "Task Scheduler (admin):\n"
         "- /task help\n"
+        '- Upload a .py file as document, then run /task add "0 */5 * * * *"\n'
         '- /task add <script_name.py> "<sec min hour day month day_of_week>"\n'
         "- /task check <script_name.py>\n"
         "- /tasks\n\n"
