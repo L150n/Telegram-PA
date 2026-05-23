@@ -121,16 +121,38 @@ import json
 print(json.dumps({"success": True, "message": "Heartbeat OK"}))
 ```
 
+Add a task (6-field cron: `sec min hour day month day_of_week`):
+
+```bash
+/task add "0 */5 * * * *"             # Uses latest uploaded .py from this admin
+/task add my_task.py "0 */5 * * * *"  # Explicit script name
+```
+
+Install required libraries for shared scripts:
+
+```bash
+/task install requests pandas
+/task install numpy,python-dateutil
+```
+
+Upload flow in Telegram (admin):
+
+```text
+1) Upload .py file in chat
+2) Bot saves it to bot/scheduler/scripts/
+3) Run /task add "0 */5 * * * *"
+```
+
 Add a task:
 
 ```bash
-/task add example.py 300
+/task add example.py "0 */5 * * * *"
 ```
 
 Expected add confirmation:
 
 ```text
-✅ Task 'example.py' scheduled every 300s. Validation: Script validation passed. Confirmation: task added successfully.
+✅ Task 'example.py' scheduled with cron '0 */5 * * * *'. Validation: Script validation passed. Confirmation: task added successfully.
 ```
 
 ## Documentation

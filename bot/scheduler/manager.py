@@ -9,6 +9,7 @@ from datetime import datetime, UTC
 from typing import Dict, List, Optional, Callable, Any
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from .runner import run_script
@@ -49,13 +50,18 @@ class TaskManager:
             CREATE TABLE IF NOT EXISTS tasks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 script_name TEXT UNIQUE NOT NULL,
-                interval_seconds INTEGER NOT NULL,
+                interval_seconds INTEGER,
+                cron_expression TEXT,
                 enabled INTEGER DEFAULT 1,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 last_run TIMESTAMP,
                 last_status TEXT
             )
         """)
+        # Backward-compatible migration for older schema.
+        columns = {row[1] for row in cursor.execute("PRAGMA table_info(tasks)").fetchall()}
+        if "cron_expression" not in columns:
+            cursor.execute("ALTER TABLE tasks ADD COLUMN cron_expression TEXT")
         
         conn.commit()
         conn.close()
@@ -76,13 +82,13 @@ class TaskManager:
         script_name = Path(script_name).name
         return self.scripts_dir / script_name
     
-    def add_task(self, script_name: str, interval_seconds: int, validate: bool = True) -> tuple[bool, str]:
+    def add_task(self, script_name: str, cron_expression: str, validate: bool = True) -> tuple[bool, str]:
         """
         Add a new scheduled task.
         
         Args:
             script_name: Name of the script file (relative to scripts folder)
-            interval_seconds: Interval in seconds
+            cron_expression: Cron expression (6 fields: sec min hour day month day_of_week)
             validate: Whether to validate the script before adding
             
         Returns:
@@ -94,8 +100,9 @@ class TaskManager:
         if not script_path.exists():
             return False, f"Script not found: {script_name}"
         
-        if interval_seconds < 30:
-            return False, "Minimum interval is 30 seconds"
+        cron_valid, cron_message = self._validate_cron_expression(cron_expression)
+        if not cron_valid:
+            return False, cron_message
         
         validation_message = ""
         # Validate script if requested
@@ -110,18 +117,18 @@ class TaskManager:
             cursor = conn.cursor()
             
             cursor.execute("""
-                INSERT OR REPLACE INTO tasks (script_name, interval_seconds, enabled)
-                VALUES (?, ?, 1)
-            """, (script_name, interval_seconds))
+                INSERT OR REPLACE INTO tasks (script_name, interval_seconds, cron_expression, enabled)
+                VALUES (?, NULL, ?, 1)
+            """, (script_name, cron_expression))
             
             conn.commit()
             conn.close()
             
             # Schedule the task
-            self._schedule_task(script_name, interval_seconds)
+            self._schedule_task(script_name, cron_expression=cron_expression, interval_seconds=None)
             
             return True, (
-                f"Task '{script_name}' scheduled every {interval_seconds}s."
+                f"Task '{script_name}' scheduled with cron '{cron_expression}'."
                 f"{validation_message} Confirmation: task added successfully."
             )
         
@@ -187,7 +194,7 @@ class TaskManager:
             conn = sqlite3.connect(str(self.db_path))
             cursor = conn.cursor()
             cursor.execute("""
-                SELECT script_name, interval_seconds, enabled, created_at, last_run, last_status
+                SELECT script_name, interval_seconds, cron_expression, enabled, created_at, last_run, last_status
                 FROM tasks
                 ORDER BY created_at DESC
             """)
@@ -197,10 +204,11 @@ class TaskManager:
                 tasks.append({
                     "script_name": row[0],
                     "interval_seconds": row[1],
-                    "enabled": bool(row[2]),
-                    "created_at": row[3],
-                    "last_run": row[4],
-                    "last_status": row[5]
+                    "cron_expression": row[2],
+                    "enabled": bool(row[3]),
+                    "created_at": row[4],
+                    "last_run": row[5],
+                    "last_status": row[6]
                 })
             
             conn.close()
@@ -229,7 +237,12 @@ class TaskManager:
         except Exception as e:
             return False, f"Installation error: {str(e)}"
     
-    def _schedule_task(self, script_name: str, interval_seconds: int):
+    def _schedule_task(
+        self,
+        script_name: str,
+        cron_expression: Optional[str],
+        interval_seconds: Optional[int],
+    ):
         """Add a task to the scheduler."""
         script_path = self._get_script_path(script_name)
         
@@ -238,9 +251,25 @@ class TaskManager:
             self.scheduler.remove_job(script_name)
         
         # Add new job
+        trigger = None
+        if cron_expression:
+            fields = cron_expression.strip().split()
+            trigger = CronTrigger(
+                second=fields[0],
+                minute=fields[1],
+                hour=fields[2],
+                day=fields[3],
+                month=fields[4],
+                day_of_week=fields[5],
+            )
+        elif interval_seconds:
+            trigger = IntervalTrigger(seconds=interval_seconds)
+        else:
+            raise ValueError(f"Task '{script_name}' has no valid schedule configuration")
+
         self.scheduler.add_job(
             self._run_scheduled_task,
-            IntervalTrigger(seconds=interval_seconds),
+            trigger,
             args=[script_name, str(script_path)],
             id=script_name,
             replace_existing=True
@@ -301,14 +330,18 @@ class TaskManager:
             conn = sqlite3.connect(str(self.db_path))
             cursor = conn.cursor()
             cursor.execute("""
-                SELECT script_name, interval_seconds, enabled
+                SELECT script_name, cron_expression, interval_seconds, enabled
                 FROM tasks
             """)
             
             for row in cursor.fetchall():
-                script_name, interval_seconds, enabled = row
+                script_name, cron_expression, interval_seconds, enabled = row
                 if enabled:
-                    self._schedule_task(script_name, interval_seconds)
+                    self._schedule_task(
+                        script_name,
+                        cron_expression=cron_expression,
+                        interval_seconds=interval_seconds,
+                    )
             
             conn.close()
         except Exception as e:
@@ -320,7 +353,7 @@ class TaskManager:
             conn = sqlite3.connect(str(self.db_path))
             cursor = conn.cursor()
             cursor.execute("""
-                SELECT script_name, interval_seconds, enabled, created_at, last_run, last_status
+                SELECT script_name, interval_seconds, cron_expression, enabled, created_at, last_run, last_status
                 FROM tasks
                 WHERE script_name = ?
             """, (script_name,))
@@ -334,11 +367,34 @@ class TaskManager:
             return {
                 "script_name": row[0],
                 "interval_seconds": row[1],
-                "enabled": bool(row[2]),
-                "created_at": row[3],
-                "last_run": row[4],
-                "last_status": row[5]
+                "cron_expression": row[2],
+                "enabled": bool(row[3]),
+                "created_at": row[4],
+                "last_run": row[5],
+                "last_status": row[6]
             }
         
         except Exception as e:
             return {"error": f"Error checking task: {str(e)}"}
+
+    def _validate_cron_expression(self, cron_expression: str) -> tuple[bool, str]:
+        """Validate 6-field cron expression and return clear error messages."""
+        fields = cron_expression.strip().split()
+        if len(fields) != 6:
+            return (
+                False,
+                "Cron must have 6 fields: second minute hour day month day_of_week "
+                "(example: '0 */5 * * * *').",
+            )
+        try:
+            CronTrigger(
+                second=fields[0],
+                minute=fields[1],
+                hour=fields[2],
+                day=fields[3],
+                month=fields[4],
+                day_of_week=fields[5],
+            )
+        except Exception as e:
+            return False, f"Invalid cron expression: {e}"
+        return True, "Cron expression valid"

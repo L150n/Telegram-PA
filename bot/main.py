@@ -27,7 +27,7 @@ from telegram.ext import (
     filters,
 )
 
-from bot.config import ADMIN_CHAT_IDS, APP_LOG_FILE, BOT_TOKEN
+from bot.config import ADMIN_CHAT_IDS, APP_LOG_FILE, BOT_TOKEN, SCHEDULER_DIR
 from bot.services.downloader import DownloadBatch, DownloaderError
 from bot.services.instagram_service import (
     download_video as download_instagram_media,
@@ -114,6 +114,7 @@ ACTIVE_DOWNLOADS_LOCK = threading.Lock()
 
 # Scheduler
 TASK_MANAGER: TaskManager | None = None
+LAST_UPLOADED_SCRIPT_BY_ADMIN: dict[int, str] = {}
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -271,6 +272,42 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"Instagram detected: {pending.source_summary}\n"
         "I will download the original available quality automatically.",
         reply_markup=keyboard,
+    )
+
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    del context
+    if update.message is None or update.effective_user is None:
+        return
+    if not _is_admin(update.effective_user.id):
+        return
+    document = update.message.document
+    if document is None or not document.file_name:
+        await update.message.reply_text("Please upload a valid .py file.")
+        return
+
+    script_name = Path(document.file_name).name
+    if not script_name.endswith(".py"):
+        await update.message.reply_text("Only .py files are supported for scheduler tasks.")
+        return
+
+    scripts_dir = SCHEDULER_DIR / "scripts"
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    target_path = scripts_dir / script_name
+
+    try:
+        tg_file = await update.message.bot.get_file(document.file_id)
+        await tg_file.download_to_drive(custom_path=str(target_path))
+    except TelegramError as exc:
+        LOGGER.error("Failed to download script file: %s", exc)
+        await update.message.reply_text("Failed to save the uploaded script. Please try again.")
+        return
+
+    LAST_UPLOADED_SCRIPT_BY_ADMIN[update.effective_user.id] = script_name
+    await update.message.reply_text(
+        f"✅ Script saved: {script_name}\n"
+        'Now run: /task add "0 */5 * * * *"\n'
+        "Or choose your own 6-field cron schedule."
     )
 
 
@@ -1002,7 +1039,7 @@ def _help_text() -> str:
         "/todaylogs - admin summary of today's user activity\n\n"
         "Task Scheduler (admin):\n"
         "- /task help\n"
-        "- /task add <script_name.py> <interval_seconds>\n"
+        '- /task add <script_name.py> "<sec min hour day month day_of_week>"\n'
         "- /task check <script_name.py>\n"
         "- /tasks\n\n"
         "Task output must be valid JSON, example:\n"
@@ -1096,20 +1133,25 @@ async def task_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not args or args[0].lower() == "help":
         await update.message.reply_text(
             "Task scheduler usage:\n"
-            "/task add <script_name> <interval_seconds>\n"
+            '/task add "<sec min hour day month day_of_week>"\n'
+            '/task add <script_name.py> "<sec min hour day month day_of_week>"\n'
             "/task remove <script_name>\n"
             "/task pause <script_name>\n"
             "/task resume <script_name>\n"
             "/task check <script_name>\n"
-            "/task install <library_name>\n"
+            "/task install <library_name> [more_libs...] (comma or space separated)\n"
             "/tasks - list all tasks\n\n"
             "Script location:\n"
-            "- Place script in bot/scheduler/scripts/\n\n"
+            "- Upload .py file in Telegram (admin), bot saves to bot/scheduler/scripts/\n"
+            "- Or place file manually in bot/scheduler/scripts/\n\n"
             "Sample script (valid):\n"
             "import json\n"
             "print(json.dumps({'success': True, 'message': 'Heartbeat OK'}))\n\n"
+            "Cron examples (6 fields):\n"
+            "- Every 5 minutes: 0 */5 * * * *\n"
+            "- Every day 09:30:00: 0 30 9 * * *\n\n"
             "Expected /task add response:\n"
-            "✅ Task '<name>' scheduled every <seconds>s. Validation: Script validation passed. Confirmation: task added successfully.\n\n"
+            "✅ Task '<name>' scheduled with cron '<expr>'. Validation: Script validation passed. Confirmation: task added successfully.\n\n"
             "Prompt template:\n"
             "Write a Python script for this bot scheduler. It must run in under 20 seconds and print only valid JSON with keys success (boolean) and message (string)."
         )
@@ -1117,15 +1159,38 @@ async def task_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     
     subcommand = args[0].lower()
     
-    if subcommand == "add" and len(args) >= 3:
-        script_name = args[1]
-        try:
-            interval = int(args[2])
-            success, message = TASK_MANAGER.add_task(script_name, interval, validate=True)
-            status_emoji = "✅" if success else "❌"
-            await update.message.reply_text(f"{status_emoji} {message}")
-        except ValueError:
-            await update.message.reply_text("Interval must be an integer (seconds).")
+    if subcommand == "add" and len(args) >= 2:
+        raw = " ".join(args[1:]).strip()
+        tokens = [token.strip().strip("\"'") for token in raw.split() if token.strip()]
+        script_name: str | None
+        cron_tokens: list[str]
+
+        if tokens and tokens[0].endswith(".py"):
+            script_name = tokens[0]
+            cron_tokens = tokens[1:]
+        else:
+            script_name = LAST_UPLOADED_SCRIPT_BY_ADMIN.get(update.effective_user.id)
+            cron_tokens = tokens
+
+        if not script_name:
+            await update.message.reply_text(
+                "No script selected. Upload a .py file first, or use:\n"
+                '/task add <script_name.py> "<sec min hour day month day_of_week>"'
+            )
+            return
+
+        if len(cron_tokens) != 6:
+            await update.message.reply_text(
+                "Cron must have 6 fields:\n"
+                "second minute hour day month day_of_week\n"
+                'Example: /task add "0 */5 * * * *"'
+            )
+            return
+
+        cron_expression = " ".join(cron_tokens)
+        success, message = TASK_MANAGER.add_task(script_name, cron_expression, validate=True)
+        status_emoji = "✅" if success else "❌"
+        await update.message.reply_text(f"{status_emoji} {message}")
     
     elif subcommand == "remove" and len(args) >= 2:
         script_name = args[1]
@@ -1151,9 +1216,10 @@ async def task_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if "error" in result:
             await update.message.reply_text(f"❌ {result['error']}")
         else:
+            schedule = result.get("cron_expression") or f"every {result['interval_seconds']}s"
             text = (
                 f"📋 Task: {result['script_name']}\n"
-                f"Interval: {result['interval_seconds']}s\n"
+                f"Schedule: {schedule}\n"
                 f"Status: {'Enabled' if result['enabled'] else 'Paused'}\n"
                 f"Created: {result['created_at']}\n"
                 f"Last Run: {result['last_run'] or 'Never'}\n"
@@ -1162,11 +1228,24 @@ async def task_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await update.message.reply_text(text)
     
     elif subcommand == "install" and len(args) >= 2:
-        lib_name = args[1]
-        await update.message.reply_text(f"⏳ Installing {lib_name}...")
-        success, message = TASK_MANAGER.install_library(lib_name)
-        status_emoji = "✅" if success else "❌"
-        await update.message.reply_text(f"{status_emoji} {message}")
+        libs: list[str] = []
+        for token in args[1:]:
+            for item in token.split(","):
+                name = item.strip()
+                if name:
+                    libs.append(name)
+        libs = list(dict.fromkeys(libs))
+        if not libs:
+            await update.message.reply_text("Provide at least one library name.")
+            return
+
+        await update.message.reply_text(f"⏳ Installing libraries: {', '.join(libs)}")
+        results: list[str] = []
+        for lib in libs:
+            success, message = TASK_MANAGER.install_library(lib)
+            status_emoji = "✅" if success else "❌"
+            results.append(f"{status_emoji} {message}")
+        await update.message.reply_text("\n".join(results))
     
     elif subcommand == "list" or subcommand == "ls":
         tasks = TASK_MANAGER.list_tasks()
@@ -1176,8 +1255,9 @@ async def task_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             lines = ["📋 Scheduled Tasks:\n"]
             for task in tasks:
                 status = "✅ Enabled" if task['enabled'] else "⏸️ Paused"
+                schedule = task.get("cron_expression") or f"every {task['interval_seconds']}s"
                 lines.append(
-                    f"{task['script_name']} ({task['interval_seconds']}s) - {status}"
+                    f"{task['script_name']} ({schedule}) - {status}"
                 )
             await update.message.reply_text("\n".join(lines))
     
@@ -1206,9 +1286,10 @@ async def tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         lines = ["📋 All Scheduled Tasks:\n"]
         for task in tasks:
             status = "✅" if task['enabled'] else "⏸️"
+            schedule = task.get("cron_expression") or f"every {task['interval_seconds']}s"
             lines.append(
                 f"{status} {task['script_name']} - "
-                f"Every {task['interval_seconds']}s - "
+                f"Schedule: {schedule} - "
                 f"Last run: {task['last_run'] or 'Never'}"
             )
         await update.message.reply_text("\n".join(lines))
@@ -1246,6 +1327,7 @@ def main() -> None:
     application.add_handler(CommandHandler("todaylogs", today_logs))
     application.add_handler(CommandHandler("task", task_command))
     application.add_handler(CommandHandler("tasks", tasks_command))
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(CallbackQueryHandler(handle_user_active_action, pattern=r"^u\|cancel_active\|"))
     application.add_handler(CallbackQueryHandler(handle_selection, pattern=r"^u\|"))
