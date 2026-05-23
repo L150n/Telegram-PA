@@ -39,6 +39,7 @@ from bot.services.youtube_service import (
     list_audio_qualities,
     list_video_qualities,
 )
+from bot.scheduler import TaskManager
 from bot.utils.activity_log import log_activity
 from bot.utils.helpers import (
     build_admin_callback,
@@ -111,12 +112,16 @@ PENDING_DOWNLOADS: dict[str, PendingSelection] = {}
 ACTIVE_DOWNLOADS: dict[str, ActiveDownload] = {}
 ACTIVE_DOWNLOADS_LOCK = threading.Lock()
 
+# Scheduler
+TASK_MANAGER: TaskManager | None = None
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     del context
-    if update.message is None:
+    if update.message is None or update.effective_user is None:
         return
-    await update.message.reply_text(
+    
+    message = (
         "Send a YouTube, YouTube Music, or public Instagram link.\n\n"
         "Commands:\n"
         "/start - welcome message\n"
@@ -124,6 +129,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/processes - admin active downloads\n"
         "/todaylogs - admin summary"
     )
+    
+    if _is_admin(update.effective_user.id):
+        message += "\n\nAdmin Commands:\n/task - manage scheduled tasks\n/tasks - list tasks"
+    
+    await update.message.reply_text(message)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -990,6 +1000,15 @@ def _help_text() -> str:
         "/help - show help\n"
         "/processes - admin active downloads\n"
         "/todaylogs - admin summary of today's user activity\n\n"
+        "Task Scheduler (admin):\n"
+        "- /task help\n"
+        "- /task add <script_name.py> <interval_seconds>\n"
+        "- /task check <script_name.py>\n"
+        "- /tasks\n\n"
+        "Task output must be valid JSON, example:\n"
+        '{"success": true, "message": "Daily check completed"}\n\n'
+        "Prompt template to create script quickly:\n"
+        "Write a Python script that runs in under 20 seconds, prints only one JSON object with keys success (bool) and message (string), and exits cleanly.\n\n"
         "Tips:\n"
         "- You can cancel before download starts.\n"
         "- You can also cancel your own active download from the progress message."
@@ -1019,6 +1038,8 @@ async def _set_bot_metadata(application: Application) -> None:
             BotCommand("help", "Show usage instructions"),
             BotCommand("processes", "Admin: view active downloads"),
             BotCommand("todaylogs", "Admin: show today's user activity"),
+            BotCommand("task", "Admin: manage scheduled tasks"),
+            BotCommand("tasks", "Admin: list all tasks"),
         ]
     )
     await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
@@ -1039,12 +1060,192 @@ def _is_admin(user_id: int) -> bool:
     return user_id in ADMIN_CHAT_IDS
 
 
+# ============================================================================
+# SCHEDULER COMMAND HANDLERS
+# ============================================================================
+
+
+async def _task_send_notification(message: str) -> None:
+    """Send a task notification to all admins."""
+    if not TASK_MANAGER:
+        return
+    for admin_id in ADMIN_CHAT_IDS:
+        try:
+            # This will be set when the app is running
+            # For now, we'll use a placeholder
+            pass
+        except Exception as e:
+            LOGGER.error(f"Failed to send notification to admin {admin_id}: {e}")
+
+
+async def task_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /task command for task scheduling."""
+    if update.message is None or update.effective_user is None:
+        return
+    
+    # Only admins can use task commands
+    if not _is_admin(update.effective_user.id):
+        await update.message.reply_text("Admin access required for task commands.")
+        return
+    
+    if not TASK_MANAGER:
+        await update.message.reply_text("Task manager not initialized.")
+        return
+    
+    args = context.args
+    if not args or args[0].lower() == "help":
+        await update.message.reply_text(
+            "Task scheduler usage:\n"
+            "/task add <script_name> <interval_seconds>\n"
+            "/task remove <script_name>\n"
+            "/task pause <script_name>\n"
+            "/task resume <script_name>\n"
+            "/task check <script_name>\n"
+            "/task install <library_name>\n"
+            "/tasks - list all tasks\n\n"
+            "Script location:\n"
+            "- Place script in bot/scheduler/scripts/\n\n"
+            "Sample script (valid):\n"
+            "import json\n"
+            "print(json.dumps({'success': True, 'message': 'Heartbeat OK'}))\n\n"
+            "Expected /task add response:\n"
+            "✅ Task '<name>' scheduled every <seconds>s. Validation: Script validation passed. Confirmation: task added successfully.\n\n"
+            "Prompt template:\n"
+            "Write a Python script for this bot scheduler. It must run in under 20 seconds and print only valid JSON with keys success (boolean) and message (string)."
+        )
+        return
+    
+    subcommand = args[0].lower()
+    
+    if subcommand == "add" and len(args) >= 3:
+        script_name = args[1]
+        try:
+            interval = int(args[2])
+            success, message = TASK_MANAGER.add_task(script_name, interval, validate=True)
+            status_emoji = "✅" if success else "❌"
+            await update.message.reply_text(f"{status_emoji} {message}")
+        except ValueError:
+            await update.message.reply_text("Interval must be an integer (seconds).")
+    
+    elif subcommand == "remove" and len(args) >= 2:
+        script_name = args[1]
+        success, message = TASK_MANAGER.remove_task(script_name)
+        status_emoji = "✅" if success else "❌"
+        await update.message.reply_text(f"{status_emoji} {message}")
+    
+    elif subcommand == "pause" and len(args) >= 2:
+        script_name = args[1]
+        success, message = TASK_MANAGER.pause_task(script_name)
+        status_emoji = "✅" if success else "❌"
+        await update.message.reply_text(f"{status_emoji} {message}")
+    
+    elif subcommand == "resume" and len(args) >= 2:
+        script_name = args[1]
+        success, message = TASK_MANAGER.resume_task(script_name)
+        status_emoji = "✅" if success else "❌"
+        await update.message.reply_text(f"{status_emoji} {message}")
+    
+    elif subcommand == "check" and len(args) >= 2:
+        script_name = args[1]
+        result = TASK_MANAGER.check_task(script_name)
+        if "error" in result:
+            await update.message.reply_text(f"❌ {result['error']}")
+        else:
+            text = (
+                f"📋 Task: {result['script_name']}\n"
+                f"Interval: {result['interval_seconds']}s\n"
+                f"Status: {'Enabled' if result['enabled'] else 'Paused'}\n"
+                f"Created: {result['created_at']}\n"
+                f"Last Run: {result['last_run'] or 'Never'}\n"
+                f"Last Result: {result['last_status'] or 'No data'}"
+            )
+            await update.message.reply_text(text)
+    
+    elif subcommand == "install" and len(args) >= 2:
+        lib_name = args[1]
+        await update.message.reply_text(f"⏳ Installing {lib_name}...")
+        success, message = TASK_MANAGER.install_library(lib_name)
+        status_emoji = "✅" if success else "❌"
+        await update.message.reply_text(f"{status_emoji} {message}")
+    
+    elif subcommand == "list" or subcommand == "ls":
+        tasks = TASK_MANAGER.list_tasks()
+        if not tasks:
+            await update.message.reply_text("No tasks scheduled.")
+        else:
+            lines = ["📋 Scheduled Tasks:\n"]
+            for task in tasks:
+                status = "✅ Enabled" if task['enabled'] else "⏸️ Paused"
+                lines.append(
+                    f"{task['script_name']} ({task['interval_seconds']}s) - {status}"
+                )
+            await update.message.reply_text("\n".join(lines))
+    
+    else:
+        await update.message.reply_text("Invalid command. Use /task for help.")
+
+
+async def tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List all scheduled tasks."""
+    del context
+    if update.message is None or update.effective_user is None:
+        return
+    
+    if not _is_admin(update.effective_user.id):
+        await update.message.reply_text("Admin access required.")
+        return
+    
+    if not TASK_MANAGER:
+        await update.message.reply_text("Task manager not initialized.")
+        return
+    
+    tasks = TASK_MANAGER.list_tasks()
+    if not tasks:
+        await update.message.reply_text("No tasks scheduled.")
+    else:
+        lines = ["📋 All Scheduled Tasks:\n"]
+        for task in tasks:
+            status = "✅" if task['enabled'] else "⏸️"
+            lines.append(
+                f"{status} {task['script_name']} - "
+                f"Every {task['interval_seconds']}s - "
+                f"Last run: {task['last_run'] or 'Never'}"
+            )
+        await update.message.reply_text("\n".join(lines))
+
+
 def main() -> None:
-    application = Application.builder().token(BOT_TOKEN).post_init(_set_bot_metadata).build()
+    global TASK_MANAGER
+    
+    # Initialize task manager
+    # TaskManager expects the directory containing 'scheduler' folder
+    TASK_MANAGER = TaskManager(
+        base_dir=Path(__file__).resolve().parent
+    )
+    
+    async def post_init(application: Application) -> None:
+        """Initialize resources after bot is ready."""
+        await _set_bot_metadata(application)
+        # Start the scheduler
+        TASK_MANAGER.start()
+        LOGGER.info("Task scheduler started")
+    
+    async def post_stop(application: Application) -> None:
+        """Clean up resources when bot stops."""
+        if TASK_MANAGER:
+            TASK_MANAGER.stop()
+            LOGGER.info("Task scheduler stopped")
+    
+    application = Application.builder().token(BOT_TOKEN).build()
+    application.post_init = post_init
+    application.post_stop = post_stop
+    
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("processes", processes))
     application.add_handler(CommandHandler("todaylogs", today_logs))
+    application.add_handler(CommandHandler("task", task_command))
+    application.add_handler(CommandHandler("tasks", tasks_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(CallbackQueryHandler(handle_user_active_action, pattern=r"^u\|cancel_active\|"))
     application.add_handler(CallbackQueryHandler(handle_selection, pattern=r"^u\|"))

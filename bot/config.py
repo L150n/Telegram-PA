@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 BASE_DIR = Path(__file__).resolve().parent.parent
 DOWNLOAD_DIR = BASE_DIR / "downloads"
 LOG_DIR = BASE_DIR / "logs"
+SCHEDULER_DIR = BASE_DIR / "bot" / "scheduler"
 
 load_dotenv(BASE_DIR / ".env")
 
@@ -26,3 +27,4 @@ if not BOT_TOKEN:
 
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 LOG_DIR.mkdir(parents=True, exist_ok=True)
+SCHEDULER_DIR.mkdir(parents=True, exist_ok=True)

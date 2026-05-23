@@ -16,6 +16,7 @@ A personal-use Telegram bot for downloading media from:
 - Admin process monitor with stop controls
 - Activity tracking in `logs/activity.jsonl`
 - Error-only bot logs in `logs/bot.log`
+- Admin task scheduler for running Python scripts on intervals
 - Docker support with FFmpeg included
 
 ## Project Structure
@@ -30,6 +31,9 @@ downloads/
 logs/
 requirements.txt
 Dockerfile
+docs/
+  scheduler/
+  agent-tracking/
 ```
 
 ## Requirements
@@ -103,6 +107,39 @@ docker run --env-file .env telegram-pa-bot
 - `/processes` admin view of active downloads
 - `/todaylogs` admin summary of today's activity
 - `/todaylogs username` admin filtered summary for one user
+- `/task` admin scheduler command group (`add`, `remove`, `pause`, `resume`, `check`, `install`, `help`)
+- `/tasks` admin list all scheduled tasks
+
+## Task Scheduler
+
+Scheduler scripts live in `bot/scheduler/scripts/` and must print valid JSON.
+
+Sample valid script:
+
+```python
+import json
+print(json.dumps({"success": True, "message": "Heartbeat OK"}))
+```
+
+Add a task:
+
+```bash
+/task add example.py 300
+```
+
+Expected add confirmation:
+
+```text
+✅ Task 'example.py' scheduled every 300s. Validation: Script validation passed. Confirmation: task added successfully.
+```
+
+## Documentation
+
+- Scheduler overview: `docs/scheduler/README_SCHEDULER.md`
+- Scheduler quick start: `docs/scheduler/SCHEDULER_QUICKSTART.md`
+- Scheduler reference: `docs/scheduler/SCHEDULER_GUIDE.md`
+- Implementation notes: `docs/agent-tracking/IMPLEMENTATION.md`
+- Change tracking for AI agents: `docs/agent-tracking/FILES_CHANGED.md`
 
 ## Logging
 
